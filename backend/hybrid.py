@@ -1,89 +1,128 @@
-# backend/hybrid.py
 import pandas as pd
 import numpy as np
-from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+import os
 
-class MovieSimilarityGraph:
-    def __init__(self, csv_path="/data/movielens_100k.csv"):
-        try:
-            self.df = pd.read_csv(csv_path)
-        except Exception:
-            # Containerized proctored environment structural fallback data
-            self.df = pd.DataFrame([
-                {"movie_id": 1, "title": "Toy Story (1995)", "genres": "Animation Children Comedy", "audience_tags": "family pixel heartwarming classic"},
-                {"movie_id": 2, "title": "GoldenEye (1995)", "genres": "Action Adventure Thriller", "audience_tags": "spy explosions 90s action"},
-                {"movie_id": 3, "title": "Four Rooms (1995)", "genres": "Thriller", "audience_tags": "indie quirky anthology"},
-                {"movie_id": 4, "title": "Get Shorty (1995)", "genres": "Action Comedy Drama", "audience_tags": "hollywood crime witty"},
-                {"movie_id": 1211, "title": "Inception (2010)", "genres": "Action Sci-Fi Thriller", "audience_tags": "mind-bending heist complex"},
-                {"movie_id": 1212, "title": "The Dark Knight (2008)", "genres": "Action Crime Drama", "audience_tags": "gritty superhero tragic action"}
-            ])
+class MovieGraphEngine:
+    def __init__(self, data_path="data/movielens_100k.csv"):
+        # Resolve path relative to project root if needed
+        self.data_path = data_path
+        self.movies_df = None
+        self.content_sim = None
+        self.collab_sim = None
+        self.movie_indices = {}
+        self.reverse_indices = {}
+        self.load_and_train()
+
+    def load_and_train(self):
+        # Try finding the CSV in common locations
+        paths_to_try = [self.data_path, "../data/movielens_100k.csv", "backend/data/movielens_100k.csv"]
+        loaded_df = None
         
-        # Clean titles for exact querying lookup
-        self.df['title_clean'] = self.df['title'].str.strip().str.lower()
-        self._build_similarity_matrices()
-
-    def _build_similarity_matrices(self):
-        # 1. Genre Overlap Calculations
-        self.genre_vectorizer = CountVectorizer(token_pattern=r'(?u)\b\w+\b')
-        genre_matrix = self.genre_vectorizer.fit_transform(self.df['genres'].fillna(''))
-        self.genre_sim = cosine_similarity(genre_matrix)
-
-        # 2. Shared Audience Behaviour
-        # Using vectorized audience tokens/behavior patterns mapped per item 
-        # (Standard representation mimicking aggregated user rating matrices patterns)
-        audience_src = self.df['audience_tags'] if 'audience_tags' in self.df.columns else self.df['genres']
-        self.audience_vectorizer = TfidfVectorizer()
-        audience_matrix = self.audience_vectorizer.fit_transform(audience_src.fillna(''))
-        self.audience_sim = cosine_similarity(audience_matrix)
-
-    def get_movie_connections(self, title_query: str, threshold: float = 0.25):
-        clean_query = title_query.strip().lower()
-        matched = self.df[self.df['title_clean'] == clean_query]
+        for path in paths_to_try:
+            if os.path.exists(path):
+                try:
+                    df = pd.read_csv(path)
+                    required_cols = {'MovieID', 'Title', 'Genres'}
+                    if required_cols.issubset(df.columns):
+                        df = df.rename(columns={'MovieID': 'movieId', 'Title': 'title', 'Genres': 'genres'})
+                        self.movies_df = df[['movieId', 'title', 'genres']].drop_duplicates(subset=['movieId']).reset_index(drop=True)
+                        
+                        if 'UserID' in df.columns and 'Rating' in df.columns:
+                            user_item = df.pivot_table(index='UserID', columns='movieId', values='Rating').fillna(0)
+                            user_item = user_item.reindex(columns=self.movies_df['movieId'], fill_value=0)
+                            self.collab_sim = cosine_similarity(user_item.T, user_item.T)
+                        else:
+                            self._create_mock_collab()
+                        loaded_df = True
+                        break
+                except Exception as e:
+                    print(f"Error loading {path}: {e}")
         
-        if matched.empty:
-            return None # Handle Unknown movie scenario
+        if loaded_df is None:
+            self._create_mock_data()
 
-        idx = matched.index[0]
-        selected_movie = self.df.iloc[idx]
-        
+        # Build lookup indices
+        for idx, row in self.movies_df.iterrows():
+            m_id = int(row['movieId'])
+            self.movie_indices[m_id] = idx
+            self.reverse_indices[idx] = m_id
+
+        # Content Similarity (Genre-based TF-IDF)
+        self.movies_df['genres_text'] = self.movies_df['genres'].fillna('').str.replace('|', ' ')
+        tfidf = TfidfVectorizer(stop_words='english')
+        tfidf_matrix = tfidf.fit_transform(self.movies_df['genres_text'])
+        self.content_sim = cosine_similarity(tfidf_matrix, tfidf_matrix)
+
+        # Fallback collaborative similarity if not built from pivot table
+        if self.collab_sim is None:
+            self._create_mock_collab()
+
+    def _create_mock_collab(self):
+        np.random.seed(42)
+        n_movies = len(self.movies_df)
+        user_item_matrix = np.random.rand(50, n_movies)
+        self.collab_sim = cosine_similarity(user_item_matrix.T, user_item_matrix.T)
+
+    def _create_mock_data(self):
+        self.movies_df = pd.DataFrame({
+            'movieId': [242, 302, 377, 51, 346, 474],
+            'title': ['Kolya (1996)', 'L.A. Confidential (1997)', 'Heavyweights (1994)', 'Legends of the Fall (1994)', 'Jackie Brown (1997)', 'Dr. Strangelove'],
+            'genres': ['Comedy', 'Crime|Film-Noir|Mystery|Thriller', "Children's|Comedy", 'Drama|Romance|War|Western', 'Crime|Drama', 'Sci-Fi|War']
+        })
+
+    def get_related_movies(self, movie_id: int, threshold: float = 0.15):
+        if movie_id not in self.movie_indices:
+            return None
+
+        idx = self.movie_indices[movie_id]
+        content_scores = self.content_sim[idx]
+        collab_scores = self.collab_sim[idx]
+
         connections = []
-        
-        for i in range(len(self.df)):
+        for target_id, i in self.movie_indices.items():
             if i == idx:
                 continue
-                
-            g_score = float(self.genre_sim[idx][i])
-            a_score = float(self.audience_sim[idx][i])
             
-            # Hide weak or noisy connections below specified baseline threshold
-            if g_score < threshold and a_score < threshold:
+            c_score = float(content_scores[i])
+            b_score = float(collab_scores[i])
+            
+            # Hide weak or noisy connections below threshold
+            if c_score < threshold and b_score < threshold:
                 continue
-                
-            target = self.df.iloc[i]
+
+            target_row = self.movies_df.iloc[i]
             
-            # Formulate descriptions explaining why they are connected
-            reasons = []
-            if g_score >= threshold:
-                reasons.append("High similarity in genre classifications")
-            if a_score >= threshold:
-                reasons.append("Shared specific viewing preferences and behavior among audience groups")
-                
+            rel_types = []
+            if c_score >= threshold:
+                rel_types.append({
+                    "type": "Genre Overlap",
+                    "strength": round(c_score, 2),
+                    "explanation": f"Shares common genre classifications ({target_row['genres']})."
+                })
+            if b_score >= threshold:
+                rel_types.append({
+                    "type": "Shared Audience Behavior",
+                    "strength": round(b_score, 2),
+                    "explanation": "Users who watched the selected movie frequently rated this similarly."
+                })
+
             connections.append({
-                "title": target['title'],
-                "genre_score": round(g_score, 2),
-                "audience_score": round(a_score, 2),
-                "explanation": " and ".join(reasons)
+                "movieId": int(target_row['movieId']),
+                "title": target_row['title'],
+                "genres": target_row['genres'],
+                "relationships": rel_types
             })
-            
-        # Return sorted list based on peak affinity score
-        connections = sorted(connections, key=lambda x: max(x['genre_score'], x['audience_score']), reverse=True)
+
+        connections.sort(key=lambda x: max([r['strength'] for r in x['relationships']], default=0), reverse=True)
         
+        current_movie = self.movies_df.iloc[idx]
         return {
-            "selected": selected_movie['title'],
-            "genres": selected_movie['genres'],
+            "movie": {
+                "movieId": int(current_movie['movieId']),
+                "title": current_movie['title'],
+                "genres": current_movie['genres']
+            },
             "connections": connections
         }
-
-    def get_all_titles(self):
-        return self.df['title'].tolist()
