@@ -10,7 +10,7 @@ export default function App() {
   const [threshold, setThreshold] = useState(0.15);
 
   useEffect(() => {
-    fetch('http://localhost:8000/movies')
+    fetch('http://localhost:8000/movies', { credentials: 'include' })
       .then(res => res.json())
       .then(data => setMovies(data))
       .catch(err => console.error("Error loading movies:", err));
@@ -19,7 +19,7 @@ export default function App() {
   useEffect(() => {
     setLoading(true);
     setError(false);
-    fetch(`http://localhost:8000/graph/${selectedId}?threshold=${threshold}`)
+    fetch(`http://localhost:8000/graph/${selectedId}?threshold=${threshold}`, { credentials: 'include' })
       .then(res => {
         if (!res.ok) throw new Error("Isolated movie");
         return res.json();
